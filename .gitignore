@@ -1,0 +1,34 @@
+# Streamlit secrets（敏感信息，不上传公开仓库）
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# 数据文件（已改用 Supabase，不再需要）
+data/
+*.json
+
+# Cloudflare Tunnel（不再使用）
+.cloudflared/
+cloudflared.exe
+cloudflared.msi
+start_testgen.bat
+stop_testgen.bat
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
