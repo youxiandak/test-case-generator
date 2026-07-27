@@ -386,7 +386,6 @@ def validate_and_activate(activation_code: str, user_id: int, user_email: str) -
         supabase.table('activation_codes').update({
             "used": True,
             "used_by": user_id,
-            "user_id": user_id,
             "used_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }).eq('code', code).execute()
 
@@ -410,9 +409,10 @@ def validate_and_activate(activation_code: str, user_id: int, user_email: str) -
         try:
             insert_result = supabase.table('activation_codes').insert({
                 'code': code,
+                'product_name': '测试用例生成器 - Pro 无限版',
+                'price': 9.9,
                 'used': True,  # 直接标记为已使用
                 'used_by': user_id,
-                'user_id': user_id,
                 'used_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 'created_at': datetime.now().isoformat()
             }).execute()
