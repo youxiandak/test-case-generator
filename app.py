@@ -21,6 +21,7 @@ from datetime import date, datetime, timedelta
 from openai import OpenAI
 from supabase import create_client, Client
 from verification_service import send_verification, check_code, cleanup_expired_codes
+from mb_integration import create_purchase_order, get_user_orders, get_statistics
 
 
 # ============================================================
@@ -46,8 +47,10 @@ PAGE_ICON = "🧪"
 # 每个API Key每天免费生成次数
 FREE_DAILY_LIMIT = 5
 
-# 面包多购买链接（请替换为您的实际商品链接）
-MIANBADUO_URL = "https://mbd.pub/your-product-link"
+# 面包多配置
+MIANBADUO_URL = "https://mbd.pub/o/bread/YZaUlppuag=="
+MBD_PRODUCT_NAME = "软件测试用例生成器 - 专业版激活码"
+MBD_PRICE = 99.00  # 激活码价格
 
 # Supabase 配置（从 Streamlit Secrets 读取）
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -349,6 +352,9 @@ def set_activated(user_id: int, activation_code: str) -> None:
 def validate_and_activate(activation_code: str, user_id: int, user_email: str) -> tuple[bool, str]:
     """
     验证激活码并绑定到当前用户。
+    支持两种模式：
+    1. 预生成激活码（数据库中已存在）
+    2. 面包多订单号（通过API验证支付状态）
 
     Args:
         activation_code: 用户输入的激活码
@@ -359,38 +365,93 @@ def validate_and_activate(activation_code: str, user_id: int, user_email: str) -
         (是否成功, 提示消息)
     """
 
-    code = activation_code.strip().upper()
+    code = activation_code.strip()
 
-    # 查询激活码
+    # 先查询数据库中是否已存在该激活码
     response = supabase.table('activation_codes').select('*').eq('code', code).execute()
 
-    # 激活码不存在
-    if not response.data:
-        return False, "❌ 激活码无效，请检查后重试。"
+    if response.data:
+        # 数据库中已存在，走原有的验证流程
+        code_info = response.data[0]
 
-    code_info = response.data[0]
+        # 检查是否已被使用
+        if code_info.get("used", False):
+            used_by = code_info.get("used_by", "")
+            if used_by == user_id:
+                return False, "⚠️ 该激活码已被当前账号使用过，无需重复激活。"
+            else:
+                return False, "❌ 该激活码已被其他账号使用。"
 
-    # 激活码已被使用
-    if code_info.get("used", False):
-        used_by = code_info.get("used_by", "")
-        if used_by == user_id:
-            return False, "⚠️ 该激活码已被当前账号使用过，无需重复激活。"
-        else:
-            return False, "❌ 该激活码已被其他账号使用。"
+        # 执行激活
+        supabase.table('activation_codes').update({
+            "used": True,
+            "used_by": user_id,
+            "user_id": user_id,
+            "email": user_email,
+            "used_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }).eq('code', code).execute()
 
-    # 激活码有效，执行激活
-    supabase.table('activation_codes').update({
-        "used": True,
-        "used_by": user_id,
-        "user_id": user_id,
-        "email": user_email,
-        "used_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }).eq('code', code).execute()
+        set_activated(user_id, code)
+        return True, "✅ 激活成功！现已解除生成次数限制。"
 
-    # 标记用户为已激活
-    set_activated(user_id, code)
+    # 数据库中不存在，作为面包多订单号处理
+    # 面包多订单号是32位字母数字组合，设置最小长度避免无意义输入
+    if len(code) >= 20:  # 支持面包多订单号（32位）或较长的自定义订单号
 
-    return True, "✅ 激活成功！现已解除生成次数限制。"
+        # 调用面包多API验证订单状态
+        from mb_integration import verify_order_paid
+
+        with st.spinner("⏳ 正在验证订单状态..."):
+            is_paid, api_message = verify_order_paid(code)
+
+        if not is_paid:
+            return False, api_message
+
+        # 订单已支付，创建激活码记录并激活
+        try:
+            insert_result = supabase.table('activation_codes').insert({
+                'code': code,
+                'used': True,  # 直接标记为已使用
+                'used_by': user_id,
+                'user_id': user_id,
+                'email': user_email,
+                'used_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'created_at': datetime.now().isoformat()
+            }).execute()
+
+            if insert_result.data:
+                # 插入后立即验证，防止竞态条件
+                verify_result = supabase.table('activation_codes').select('*').eq('code', code).execute()
+
+                if verify_result.data:
+                    record = verify_result.data[0]
+                    if record.get('used_by') != user_id:
+                        # 记录已被其他用户抢占
+                        return False, "❌ 该激活码已被其他账号使用。"
+
+                # 标记用户为已激活
+                set_activated(user_id, code)
+                return True, "✅ 订单验证成功！激活成功，现已解除生成次数限制。"
+            else:
+                return False, "❌ 激活失败，请重试。"
+
+        except Exception as e:
+            # 可能是唯一约束冲突（被其他用户抢先激活）
+            if 'duplicate' in str(e).lower() or 'unique' in str(e).lower():
+                # 重新查询确认
+                verify_result = supabase.table('activation_codes').select('*').eq('code', code).execute()
+                if verify_result.data:
+                    record = verify_result.data[0]
+                    if record.get('used_by') != user_id:
+                        return False, "❌ 该激活码已被其他账号使用。"
+                    else:
+                        # 已被当前用户激活
+                        set_activated(user_id, code)
+                        return True, "✅ 激活成功！"
+            return False, f"❌ 激活失败: {str(e)}"
+
+    # 既不是数据库中的激活码，也不是有效的订单号格式
+    return False, "❌ 激活码无效，请检查后重试。"
 
 
 def is_user_activated(user_id: int) -> bool:
@@ -429,6 +490,221 @@ def get_remaining_count(user_id: int) -> int:
     used = info.get("count", 0)
     return max(0, FREE_DAILY_LIMIT - used)
 
+
+# ============================================================
+# 激活码购买功能（面包多集成）
+# ============================================================
+
+def create_purchase_order(user_id: int) -> dict:
+    """
+    创建面包多购买订单
+
+    Args:
+        user_id: 用户ID
+
+    Returns:
+        订单信息字典
+    """
+    try:
+        # 导入面包多集成
+        from mb_integration import create_purchase_order as mbd_create_order
+
+        result = mbd_create_order(user_id)
+
+        if result['success']:
+            # 保存订单到数据库
+            order_data = {
+                'order_id': result['order_id'],
+                'user_id': user_id,
+                'activation_code_id': None,  # 支付成功后更新
+                'product_name': MBD_PRODUCT_NAME,
+                'price': MBD_PRICE,
+                'commission_rate': 0.50,
+                'commission_amount': MBD_PRICE * 0.50,
+                'status': 'pending',
+                'payment_method': 'breadmore'
+            }
+
+            supabase.table('orders').insert(order_data).execute()
+
+            return {
+                'success': True,
+                'order_id': result['order_id'],
+                'payment_url': result['payment_url'],
+                'qrcode_url': result['qrcode_url'],
+                'message': '订单创建成功，请完成支付'
+            }
+        else:
+            return result
+
+    except Exception as e:
+        return {
+            'success': False,
+            'message': f'创建订单失败: {str(e)}'
+        }
+
+def get_user_orders(user_id: int) -> list:
+    """
+    获取用户的订单列表
+
+    Args:
+        user_id: 用户ID
+
+    Returns:
+        订单列表
+    """
+    try:
+        from mb_integration import get_user_orders as mbd_get_orders
+
+        orders = mbd_get_orders(user_id)
+
+        # 添加激活码信息
+        for order in orders:
+            if order.get('activation_code_id'):
+                # 查询激活码信息
+                code_result = supabase.table('activation_codes').select('code').eq('id', order['activation_code_id']).execute()
+                if code_result.data:
+                    order['activation_code'] = code_result.data[0]['code']
+
+        return orders
+
+    except Exception as e:
+        st.error(f"获取订单失败: {str(e)}")
+        return []
+
+def handle_payment_callback(order_id: str, status: str) -> bool:
+    """
+    处理支付回调
+
+    Args:
+        order_id: 订单ID
+        status: 支付状态
+
+    Returns:
+        是否处理成功
+    """
+    try:
+        if status == 'paid':
+            # 更新订单状态
+            supabase.table('orders').update({
+                'status': 'completed',
+                'completion_time': datetime.now().isoformat()
+            }).eq('order_id', order_id).execute()
+
+            return True
+        return False
+
+    except Exception as e:
+        st.error(f"处理支付回调失败: {str(e)}")
+        return False
+
+def show_purchase_page(user_id: int):
+    """
+    显示购买页面
+
+    Args:
+        user_id: 用户ID
+    """
+    st.subheader("🛒 购买激活码")
+
+    # 显示商品信息
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.markdown(f"""
+        ### {MBD_PRODUCT_NAME}
+
+        **价格**: ¥{MBD_PRICE}
+        **功能**: 解除生成次数限制，无限次使用
+        **支持**: 终身有效
+
+        **商品说明**:
+        - 购买后立即激活您的账号
+        - 无限制生成测试用例
+        - 专业技术支持
+        """)
+
+    with col2:
+        st.image("https://via.placeholder.com/150", caption="商品图片")
+
+    # 购买按钮
+    if st.button("🛒 立即购买", use_container_width=True):
+        with st.spinner("正在创建订单..."):
+            order_result = create_purchase_order(user_id)
+
+            if order_result['success']:
+                st.session_state.purchase_order = order_result
+                st.rerun()
+            else:
+                st.error(f"创建订单失败: {order_result['message']}")
+
+    # 显示订单信息
+    if 'purchase_order' in st.session_state:
+        order = st.session_state.purchase_order
+
+        st.success("✅ 订单创建成功！")
+
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            st.markdown(f"""
+            **订单号**: {order['order_id']}
+            **支付金额**: ¥{MBD_PRICE}
+            """)
+
+            if order.get('qrcode_url'):
+                st.image(order['qrcode_url'], caption="扫码支付")
+
+        with col2:
+            st.markdown("""
+            **支付方式**:
+            - 微信支付
+            - 支付宝
+
+            **支付说明**:
+            - 请在30分钟内完成支付
+            - 支付成功后自动激活
+            - 如有问题请联系客服
+            """)
+
+            if order.get('payment_url'):
+                st.markdown(f"[点击前往支付]({order['payment_url']})")
+
+    # 我的订单
+    st.divider()
+    st.subheader("📋 我的订单")
+
+    orders = get_user_orders(user_id)
+
+    if orders:
+        for order in orders:
+            status_text = {
+                'pending': '待支付',
+                'paid': '已支付',
+                'completed': '已完成',
+                'failed': '支付失败'
+            }.get(order.get('status', ''), '未知状态')
+
+            with st.expander(f"订单号: {order['order_id']} - {status_text}"):
+                col1, col2, col3 = st.columns([1, 1, 1])
+
+                with col1:
+                    st.write(f"**商品**: {order['product_name']}")
+                    st.write(f"**价格**: ¥{order['price']}")
+
+                with col2:
+                    st.write(f"**状态**: {status_text}")
+                    st.write(f"**时间**: {order['created_at'][:19]}")
+
+                with col3:
+                    if order.get('activation_code'):
+                        st.success(f"激活码: {order['activation_code']}")
+                    elif order['status'] == 'pending':
+                        if st.button("重新支付", key=f"retry_{order['order_id']}"):
+                            # 重新创建订单逻辑
+                            pass
+    else:
+        st.info("暂无订单记录")
 
 # ============================================================
 # 评价功能（Supabase）
@@ -842,11 +1118,7 @@ def render_usage_sidebar(user_id: int, user_email: str):
 
     # 购买提示（未激活时显示）
     if remaining != -1:
-        st.markdown(
-            f'<div style="text-align:center;font-size:13px;color:#888;">'
-            f'📌 次数不够？[前往面包多购买激活码]({MIANBADUO_URL})</div>',
-            unsafe_allow_html=True,
-        )
+        st.info(f"📌 次数不够？[前往面包多购买激活码]({MIANBADUO_URL}) 💰 ¥{MBD_PRICE}")
 
 
 # ============================================================
@@ -950,6 +1222,11 @@ def main():
 
     # 清理过期验证码
     cleanup_expired_codes()
+
+    # 处理购买页面路由
+    if st.session_state.get('show_purchase_page') and st.session_state.user:
+        show_purchase_page(st.session_state.user['id'])
+        return
 
     # ---------- 页面基础配置 ----------
     st.set_page_config(
