@@ -4,19 +4,23 @@
 
 功能：
   - 根据需求描述自动生成结构化测试用例
-  - 每个 API Key 每天免费生成 5 次
+  - 用户注册/登录系统
+  - 每个邮箱每天免费生成 5 次
   - 超出限制后需输入激活码解除限制
   - 激活码通过面包多售卖
   - 数据存储：Supabase PostgreSQL
+  - 用户评价功能
 """
 
 import streamlit as st
 import pandas as pd
 import io
 import hashlib
-from datetime import date, datetime
+import bcrypt
+from datetime import date, datetime, timedelta
 from openai import OpenAI
 from supabase import create_client, Client
+from verification_service import send_verification, check_code, cleanup_expired_codes
 
 
 # ============================================================
@@ -58,43 +62,197 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ============================================================
-# API Key 哈希工具
+# Session State 管理
 # ============================================================
 
-def hash_api_key(api_key: str) -> str:
+def init_session_state():
+    """初始化 session state"""
+    if 'user' not in st.session_state:
+        st.session_state.user = None
+    if 'verification_sent' not in st.session_state:
+        st.session_state.verification_sent = False
+    if 'verification_email' not in st.session_state:
+        st.session_state.verification_email = ""
+    if 'verification_type' not in st.session_state:
+        st.session_state.verification_type = ""
+    if 'temp_password' not in st.session_state:
+        st.session_state.temp_password = ""
+
+
+# ============================================================
+# 密码哈希工具
+# ============================================================
+
+def hash_password(password: str) -> str:
+    """使用 bcrypt 哈希密码"""
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """验证密码"""
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+
+# ============================================================
+# 用户管理函数
+# ============================================================
+
+def register_user(email: str, password: str) -> tuple[bool, str]:
     """
-    对 API Key 做 SHA-256 哈希，用于存储时脱敏。
-    实际 API Key 明文不会落盘。
+    注册新用户
 
     Args:
-        api_key: 明文 API Key
+        email: 邮箱
+        password: 密码
 
     Returns:
-        SHA-256 哈希值（十六进制字符串）
+        (成功状态, 消息)
     """
+    try:
+        # 检查邮箱是否已存在
+        response = supabase.table('users').select('id').eq('email', email).execute()
 
-    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        if response.data:
+            return False, "该邮箱已被注册"
+
+        # 哈希密码
+        password_hash = hash_password(password)
+
+        # 创建用户
+        result = supabase.table('users').insert({
+            'email': email,
+            'password_hash': password_hash,
+            'created_at': datetime.now().isoformat()
+        }).execute()
+
+        if result.data:
+            return True, "注册成功！请登录"
+        else:
+            return False, "注册失败，请重试"
+
+    except Exception as e:
+        return False, f"注册失败: {str(e)}"
 
 
-# ============================================================
-# 使用次数管理（Supabase）
-# ============================================================
-
-def get_usage_info(api_key_hash: str) -> dict:
+def login_user(email: str, password: str) -> tuple[bool, str]:
     """
-    获取某个 API Key 当日的使用信息。
-
-    返回格式：
-        {
-            "date": "2026-07-21",   # 当天日期
-            "count": 3,             # 今日已用次数
-            "activated": false      # 是否已激活（无限次）
-        }
-
-    如果记录不存在或日期不是今天，则返回默认值（0次、未激活）。
+    用户登录
 
     Args:
-        api_key_hash: API Key 的哈希值
+        email: 邮箱
+        password: 密码
+
+    Returns:
+        (成功状态, 消息)
+    """
+    try:
+        # 查找用户
+        response = supabase.table('users').select('*').eq('email', email).execute()
+
+        if not response.data:
+            return False, "邮箱不存在"
+
+        user = response.data[0]
+
+        # 验证密码
+        if verify_password(password, user['password_hash']):
+            # 更新最后登录时间
+            supabase.table('users').update({
+                'last_login': datetime.now().isoformat()
+            }).eq('id', user['id']).execute()
+
+            # 保存到 session state
+            st.session_state.user = {
+                'id': user['id'],
+                'email': user['email'],
+                'activation_code': user.get('activation_code'),
+                'created_at': user['created_at']
+            }
+
+            return True, "登录成功！"
+        else:
+            return False, "密码错误"
+
+    except Exception as e:
+        return False, f"登录失败: {str(e)}"
+
+
+def logout_user():
+    """退出登录"""
+    st.session_state.user = None
+    st.rerun()
+
+
+def send_email_verification_code(email: str, code_type: str = "register") -> tuple[bool, str]:
+    """
+    发送邮箱验证码
+
+    Args:
+        email: 邮箱
+        code_type: 验证码类型（register/login）
+
+    Returns:
+        (成功状态, 消息)
+    """
+    try:
+        # 检查邮箱格式
+        if '@' not in email or len(email.split('@')) != 2:
+            return False, "邮箱格式不正确"
+
+        # 发送验证码
+        result = send_verification(email, code_type)
+
+        if result['success']:
+            st.session_state.verification_sent = True
+            st.session_state.verification_email = email
+            st.session_state.verification_type = code_type
+            return True, "验证码已发送"
+        else:
+            return False, result['message']
+
+    except Exception as e:
+        return False, f"发送验证码失败: {str(e)}"
+
+
+def verify_email_code(email: str, code: str, code_type: str) -> tuple[bool, str]:
+    """
+    验证邮箱验证码
+
+    Args:
+        email: 邮箱
+        code: 用户输入的验证码
+        code_type: 验证码类型
+
+    Returns:
+        (成功状态, 消息)
+    """
+    try:
+        # 调用验证码服务的验证函数
+        result = check_code(email, code, code_type)
+
+        if result['success']:
+            return True, "验证成功"
+        else:
+            if result.get('expired'):
+                return False, "验证码已过期"
+            else:
+                return False, result['message']
+
+    except Exception as e:
+        return False, f"验证失败: {str(e)}"
+
+
+# ============================================================
+# 使用次数管理（Supabase + 用户关联）
+# ============================================================
+
+def get_usage_info(user_id: int) -> dict:
+    """
+    获取用户的使用信息。
+
+    Args:
+        user_id: 用户 ID
 
     Returns:
         使用信息字典
@@ -103,7 +261,7 @@ def get_usage_info(api_key_hash: str) -> dict:
     today_str = date.today().isoformat()
 
     # 查询数据库
-    response = supabase.table('usage').select('*').eq('api_key_hash', api_key_hash).execute()
+    response = supabase.table('usage').select('*').eq('user_id', user_id).execute()
 
     if not response.data:
         # 无记录，返回默认
@@ -119,7 +277,7 @@ def get_usage_info(api_key_hash: str) -> dict:
         supabase.table('usage').update({
             "date": today_str,
             "count": 0
-        }).eq('api_key_hash', api_key_hash).execute()
+        }).eq('user_id', user_id).execute()
 
     # 确保字段完整
     record.setdefault("count", 0)
@@ -128,38 +286,39 @@ def get_usage_info(api_key_hash: str) -> dict:
     return record
 
 
-def increment_usage(api_key_hash: str) -> None:
+def increment_usage(user_id: int) -> None:
     """
-    将指定 API Key 的今日使用次数 +1，并更新到数据库。
+    将用户的今日使用次数 +1，并更新到数据库。
 
     Args:
-        api_key_hash: API Key 的哈希值
+        user_id: 用户 ID
     """
 
-    info = get_usage_info(api_key_hash)
+    info = get_usage_info(user_id)
     new_count = info.get("count", 0) + 1
 
     # 使用 upsert：如果记录存在则更新，不存在则插入
     supabase.table('usage').upsert({
-        "api_key_hash": api_key_hash,
+        "user_id": user_id,
         "date": info["date"],
         "count": new_count,
         "activated": info.get("activated", False)
     }).execute()
 
 
-def set_activated(api_key_hash: str) -> None:
+def set_activated(user_id: int, activation_code: str) -> None:
     """
-    将指定 API Key 标记为已激活（无限次使用）。
+    将用户标记为已激活（无限次使用）。
 
     Args:
-        api_key_hash: API Key 的哈希值
+        user_id: 用户 ID
+        activation_code: 激活码
     """
 
     today_str = date.today().isoformat()
 
     # 检查是否有记录
-    response = supabase.table('usage').select('*').eq('api_key_hash', api_key_hash).execute()
+    response = supabase.table('usage').select('*').eq('user_id', user_id).execute()
 
     if response.data:
         # 更新现有记录
@@ -167,34 +326,40 @@ def set_activated(api_key_hash: str) -> None:
             "activated": True,
             "date": today_str,
             "count": 0  # 激活后重置今日次数
-        }).eq('api_key_hash', api_key_hash).execute()
+        }).eq('user_id', user_id).execute()
     else:
         # 插入新记录
         supabase.table('usage').insert({
-            "api_key_hash": api_key_hash,
+            "user_id": user_id,
             "date": today_str,
             "count": 0,
             "activated": True
         }).execute()
 
+    # 更新用户的激活码
+    supabase.table('users').update({
+        "activation_code": activation_code
+    }).eq('id', user_id).execute()
+
 
 # ============================================================
-# 激活码管理（Supabase）
+# 激活码管理（Supabase + 用户关联）
 # ============================================================
 
-def validate_and_activate(code: str, api_key_hash: str) -> tuple[bool, str]:
+def validate_and_activate(activation_code: str, user_id: int, user_email: str) -> tuple[bool, str]:
     """
-    验证激活码并绑定到当前 API Key。
+    验证激活码并绑定到当前用户。
 
     Args:
-        code:          用户输入的激活码
-        api_key_hash:  当前 API Key 的哈希值
+        activation_code: 用户输入的激活码
+        user_id: 当前用户 ID
+        user_email: 用户邮箱
 
     Returns:
         (是否成功, 提示消息)
     """
 
-    code = code.strip().upper()
+    code = activation_code.strip().upper()
 
     # 查询激活码
     response = supabase.table('activation_codes').select('*').eq('code', code).execute()
@@ -208,7 +373,7 @@ def validate_and_activate(code: str, api_key_hash: str) -> tuple[bool, str]:
     # 激活码已被使用
     if code_info.get("used", False):
         used_by = code_info.get("used_by", "")
-        if used_by == api_key_hash:
+        if used_by == user_id:
             return False, "⚠️ 该激活码已被当前账号使用过，无需重复激活。"
         else:
             return False, "❌ 该激活码已被其他账号使用。"
@@ -216,51 +381,128 @@ def validate_and_activate(code: str, api_key_hash: str) -> tuple[bool, str]:
     # 激活码有效，执行激活
     supabase.table('activation_codes').update({
         "used": True,
-        "used_by": api_key_hash,
+        "used_by": user_id,
+        "user_id": user_id,
+        "email": user_email,
         "used_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }).eq('code', code).execute()
 
-    # 标记 API Key 为已激活
-    set_activated(api_key_hash)
+    # 标记用户为已激活
+    set_activated(user_id, code)
 
     return True, "✅ 激活成功！现已解除生成次数限制。"
 
 
-def is_key_activated(api_key_hash: str) -> bool:
+def is_user_activated(user_id: int) -> bool:
     """
-    检查 API Key 是否已激活（不受每日次数限制）。
+    检查用户是否已激活（不受每日次数限制）。
 
     Args:
-        api_key_hash: API Key 的哈希值
+        user_id: 用户 ID
 
     Returns:
         是否已激活
     """
 
-    info = get_usage_info(api_key_hash)
+    info = get_usage_info(user_id)
     return info.get("activated", False)
 
 
-def get_remaining_count(api_key_hash: str) -> int:
+def get_remaining_count(user_id: int) -> int:
     """
     获取今日剩余可生成次数。
 
-    已激活的 Key 返回 -1 表示无限制。
+    已激活的用户返回 -1 表示无限制。
 
     Args:
-        api_key_hash: API Key 的哈希值
+        user_id: 用户 ID
 
     Returns:
         剩余次数；-1 表示无限制
     """
 
-    info = get_usage_info(api_key_hash)
+    info = get_usage_info(user_id)
 
     if info.get("activated", False):
         return -1  # 无限制
 
     used = info.get("count", 0)
     return max(0, FREE_DAILY_LIMIT - used)
+
+
+# ============================================================
+# 评价功能（Supabase）
+# ============================================================
+
+def submit_review(user_id: int, name: str, email: str, rating: int, content: str) -> bool:
+    """
+    提交用户评价。
+
+    Args:
+        user_id: 用户 ID
+        name: 用户名（可选）
+        email: 邮箱（可选）
+        rating: 评分（1-5）
+        content: 评价内容
+
+    Returns:
+        是否提交成功
+    """
+
+    try:
+        response = supabase.table('reviews').insert({
+            "user_id": user_id,
+            "name": name,
+            "email": email,
+            "rating": rating,
+            "content": content
+        }).execute()
+
+        if response.data and len(response.data) > 0:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def get_all_reviews(limit: int = 20) -> list:
+    """
+    获取所有评价（按时间倒序）。
+
+    Args:
+        limit: 返回数量限制
+
+    Returns:
+        评价列表
+    """
+
+    try:
+        response = supabase.table('reviews').select('*').order('created_at', desc=True).limit(limit).execute()
+        return response.data or []
+    except Exception:
+        return []
+
+
+def calculate_average_rating() -> float:
+    """
+    计算平均评分。
+
+    Returns:
+        平均分（四舍五入到 1 位小数）
+    """
+
+    try:
+        response = supabase.table('reviews').select('rating').execute()
+        if not response.data:
+            return 0.0
+
+        ratings = [r['rating'] for r in response.data if 'rating' in r]
+        if not ratings:
+            return 0.0
+
+        return round(sum(ratings) / len(ratings), 1)
+    except Exception:
+        return 0.0
 
 
 # ============================================================
@@ -279,6 +521,25 @@ def build_prompt(requirement: str, test_type: str, style: str) -> str:
     Returns:
         拼接好的完整 prompt 字符串
     """
+
+    # 如果需求描述过长，使用更简洁的prompt
+    if len(requirement) > 3000:
+        simplified_requirement = requirement[:1000] + "...[内容已简化]"
+        step_instruction = (
+            "测试步骤尽量简短，每项用一句话概括即可。"
+        )
+        prompt = f"""生成{test_type}用例。
+
+需求：{simplified_requirement}
+
+要求：
+1. 输出Markdown表格：|编号|模块|标题|前置条件|步骤|预期结果|
+2. 生成8-12条用例，包含正常、异常、边界场景
+3. {step_instruction}
+4. 编号格式：TC-001, TC-002...
+
+直接输出表格："""
+        return prompt
 
     # 根据输出风格决定步骤描述的详细程度
     if style == "详细":
@@ -315,6 +576,32 @@ def build_prompt(requirement: str, test_type: str, style: str) -> str:
 # 模型调用函数
 # ============================================================
 
+def validate_zhipu_api_key(api_key: str) -> bool:
+    """
+    验证智谱API Key是否有效。
+
+    Args:
+        api_key: 智谱 AI 的 API Key
+
+    Returns:
+        是否有效
+    """
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url=ZHIPU_BASE_URL,
+        )
+        # 发送一个小的测试请求
+        response = client.chat.completions.create(
+            model="glm-4-flash",
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=1
+        )
+        return True
+    except:
+        return False
+
+
 def call_glm(api_key: str, prompt: str, model: str = DEFAULT_MODEL) -> str:
     """
     调用智谱 GLM 模型，返回生成的文本。
@@ -330,6 +617,10 @@ def call_glm(api_key: str, prompt: str, model: str = DEFAULT_MODEL) -> str:
     Raises:
         Exception: 调用失败时抛出异常，由上层捕获处理
     """
+
+    # 先验证API Key
+    if not validate_zhipu_api_key(api_key):
+        raise Exception("API Key无效，请检查是否正确")
 
     client = OpenAI(
         api_key=api_key,
@@ -424,18 +715,84 @@ def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 # ============================================================
-# 侧边栏：使用次数与激活码 UI
+# 侧边栏组件
 # ============================================================
 
-def render_usage_sidebar(api_key_hash: str) -> None:
+def show_login_register_sidebar():
+    """
+    显示登录/注册表单
+    """
+    tab1, tab2 = st.tabs(["🔐 登录", "📝 注册"])
+
+    with tab1:
+        st.subheader("登录")
+
+        email = st.text_input("邮箱", key="login_email")
+        password = st.text_input("密码", type="password", key="login_password")
+
+        if st.button("登录", use_container_width=True):
+            if not email or not password:
+                st.error("请填写邮箱和密码")
+            else:
+                success, msg = login_user(email, password)
+                if success:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+        with st.expander("忘记密码？"):
+            st.info("请通过验证码重置密码")
+
+    with tab2:
+        st.subheader("注册")
+
+        reg_email = st.text_input("邮箱", key="reg_email")
+
+        if st.button("发送验证码", key="send_reg_code", use_container_width=True):
+            if not reg_email:
+                st.error("请输入邮箱")
+            else:
+                success, msg = send_email_verification_code(reg_email, "register")
+                if success:
+                    st.success(msg)
+                    st.session_state.verification_type = "register"
+                else:
+                    st.error(msg)
+
+        if st.session_state.verification_sent and st.session_state.verification_type == "register":
+            reg_code = st.text_input("验证码", key="reg_code")
+            new_password = st.text_input("密码", type="password", key="new_password")
+            confirm_password = st.text_input("确认密码", type="password", key="confirm_password")
+
+            if st.button("注册", use_container_width=True):
+                if not reg_code or not new_password or not confirm_password:
+                    st.error("请填写所有字段")
+                elif new_password != confirm_password:
+                    st.error("两次密码不一致")
+                else:
+                    success, msg = verify_email_code(reg_email, reg_code, "register")
+                    if success:
+                        success, msg = register_user(reg_email, new_password)
+                        if success:
+                            st.success(msg)
+                            st.session_state.verification_sent = False
+                        else:
+                            st.error(msg)
+                    else:
+                        st.error(msg)
+
+
+def render_usage_sidebar(user_id: int, user_email: str):
     """
     在侧边栏渲染使用次数提示和激活码输入区域。
 
     Args:
-        api_key_hash: API Key 的哈希值
+        user_id: 用户 ID
+        user_email: 用户邮箱
     """
 
-    remaining = get_remaining_count(api_key_hash)
+    remaining = get_remaining_count(user_id)
 
     if remaining == -1:
         # 已激活，无限制
@@ -476,7 +833,7 @@ def render_usage_sidebar(api_key_hash: str) -> None:
         if not code:
             st.error("请先输入激活码！")
         else:
-            success, msg = validate_and_activate(code, api_key_hash)
+            success, msg = validate_and_activate(code, user_id, user_email)
             if success:
                 st.success(msg)
                 st.rerun()  # 刷新页面以更新状态
@@ -493,11 +850,106 @@ def render_usage_sidebar(api_key_hash: str) -> None:
 
 
 # ============================================================
-# Streamlit 页面主体
+# 评价展示组件
+# ============================================================
+
+def show_reviews_section():
+    """
+    展示用户评价区域。
+    """
+
+    st.subheader("🌟 用户评价")
+
+    # 显示平均评分
+    avg_rating = calculate_average_rating()
+    st.markdown(
+        f'<div style="background:#f8f9fa;padding:10px;border-radius:6px;'
+        'text-align:center;font-size:16px;">'
+        f'⭐ 平均评分：<strong>{avg_rating}</strong> / 5.0 '
+        f'({get_all_reviews().__len__() if get_all_reviews() else 0} 条评价)</div>',
+        unsafe_allow_html=True,
+    )
+
+    # 显示评价列表
+    reviews = get_all_reviews()
+    if reviews:
+        for review in reviews:
+            rating_stars = "⭐" * review['rating'] + "☆" * (5 - review['rating'])
+
+            # 格式化时间
+            created_at = datetime.fromisoformat(review['created_at'].replace('Z', '+00:00'))
+            time_str = created_at.strftime("%Y-%m-%d %H:%M")
+
+            st.markdown("---")
+            with st.expander(f"{review['name'] or '匿名用户'} · {time_str}"):
+                st.markdown(f"**{rating_stars} ({review['rating']}/5)**")
+                st.write(review['content'])
+    else:
+        st.info("暂无评价，欢迎使用后分享体验！")
+
+
+# ============================================================
+# 评价提交组件
+# ============================================================
+
+def show_review_submission(user_id: int):
+    """
+    展示评价提交表单。
+
+    Args:
+        user_id: 用户 ID
+    """
+
+    st.subheader("💬 写评价")
+    st.markdown("您的反馈对我们很重要！")
+
+    with st.form("review_form"):
+        # 评分选择
+        rating = st.radio(
+            "评分",
+            [1, 2, 3, 4, 5],
+            horizontal=True,
+            captions=["😢 很不满意", "😐 一般", "👍 满意", "😊 很满意", "🤩 超级满意"]
+        )
+
+        # 基本信息
+        name = st.text_input("昵称（可选）")
+        email = st.text_input("邮箱（可选，仅用于联系）")
+
+        # 评价内容
+        content = st.text_area(
+            "评价内容",
+            placeholder="请分享您的使用体验...",
+            height=120
+        )
+
+        # 提交按钮
+        submitted = st.form_submit_button("提交评价", use_container_width=True)
+
+        if submitted:
+            if not content.strip():
+                st.error("请填写评价内容")
+            else:
+                success = submit_review(user_id, name.strip(), email.strip(), rating, content.strip())
+                if success:
+                    st.success("感谢您的评价！🎉")
+                    st.rerun()
+                else:
+                    st.error("提交失败，请重试")
+
+
+# ============================================================
+# 主应用
 # ============================================================
 
 def main():
     """应用主入口：页面布局、交互逻辑与结果展示。"""
+
+    # 初始化 session state
+    init_session_state()
+
+    # 清理过期验证码
+    cleanup_expired_codes()
 
     # ---------- 页面基础配置 ----------
     st.set_page_config(
@@ -510,153 +962,281 @@ def main():
     with st.sidebar:
         st.header("⚙️ 参数配置")
 
-        # API Key 输入（密码框）
-        api_key = st.text_input(
-            label="智谱 AI API Key",
-            type="password",
-            placeholder="请输入您的 API Key",
-            help="在 open.bigmodel.cn 获取您的 API Key，信息仅在本会话使用，不会上传。",
-        )
+        # 如果用户未登录
+        if not st.session_state.user:
+            show_login_register_sidebar()
 
-        st.divider()
+            # 应用信息
+            st.divider()
+            st.markdown("### 📄 应用信息")
+            st.markdown("- 基于 GLM-4-Flash 大模型")
+            st.markdown("- 每个邮箱每天 5 次免费")
+            st.markdown("- 激活码无限次使用")
+            st.markdown("- 支持多种测试类型")
 
-        # ---- 使用次数与激活码区域 ----
-        # 只有输入了 API Key 才显示（需要 hash 来查询记录）
-        if api_key:
-            render_usage_sidebar(hash_api_key(api_key))
         else:
-            st.info("👆 请先输入 API Key 以查看使用次数")
+            # 用户已登录
+            user = st.session_state.user
 
-        st.divider()
-
-        # 测试类型选择
-        test_type = st.selectbox(
-            label="测试类型",
-            options=TEST_TYPES,
-            index=0,
-            help="选择需要生成的测试用例类型",
-        )
-
-        # 输出风格选择
-        output_style = st.selectbox(
-            label="输出风格",
-            options=OUTPUT_STYLES,
-            index=0,
-            help="详细模式会给出完整的步骤描述，简洁模式则精简概括",
-        )
-
-        st.divider()
-
-        # 生成按钮
-        generate_btn = st.button(
-            label="🚀 生成测试用例",
-            type="primary",
-            use_container_width=True,
-        )
-
-        # 使用说明
-        st.divider()
-        with st.expander("📖 使用说明"):
+            # 显示用户信息
             st.markdown(
-                f"""
-1. 在右侧文本框中粘贴需求描述；
-2. 在左侧配置 API Key、测试类型和输出风格；
-3. 点击 **生成测试用例** 按钮；
-4. 等待模型返回结果，即可查看和下载。
-
-**免费额度**：每个 API Key 每天可免费生成 **{FREE_DAILY_LIMIT}** 次。
-**解除限制**：[前往面包多购买激活码]({MIANBADUO_URL})，输入后即可无限次使用。
-                """
+                f'<div style="background:#e8f4f8;padding:10px;border-radius:6px;'
+                f'text-align:center;font-size:14px;">'
+                f'👤 **{user["email"]}**</div>',
+                unsafe_allow_html=True,
             )
 
-    # ---------- 主区域 ----------
-    st.title(f"{PAGE_ICON} {PAGE_TITLE}")
-    st.caption("基于智谱 GLM 大模型，自动生成结构化软件测试用例")
-
-    # 需求描述输入
-    requirement = st.text_area(
-        label="📝 请粘贴需求描述",
-        height=220,
-        placeholder=(
-            "示例：用户注册功能。用户需要通过邮箱注册账号，"
-            "需要输入用户名、邮箱地址和密码。密码要求至少8位，"
-            "包含大小写字母和数字。注册成功后发送验证邮件。"
-        ),
-    )
-
-    # ---------- 生成逻辑 ----------
-    if generate_btn:
-        # 输入校验
-        if not api_key:
-            st.error("❌ 请先在侧边栏输入智谱 AI 的 API Key！")
-            return
-        if not requirement.strip():
-            st.error("❌ 请输入需求描述！")
-            return
-
-        # ---- 试用次数校验 ----
-        api_key_hash = hash_api_key(api_key)
-        remaining = get_remaining_count(api_key_hash)
-
-        if remaining == 0:
-            st.error(
-                f"❌ 今日免费生成次数已用完（{FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT}）。"
-                f"请在侧边栏输入激活码，或[前往面包多购买]({MIANBADUO_URL})。"
+            # API Key输入
+            st.text_input(
+                label="🔑 智谱AI API Key",
+                key="user_api_key",
+                placeholder="输入您的智谱AI API Key",
+                help="请输入从 https://open.bigmodel.cn/ 获取的API Key",
+                type="password"
             )
-            return
 
-        # 构建 prompt
-        prompt = build_prompt(requirement, test_type, output_style)
+            # API Key验证状态
+            if st.session_state.get("user_api_key"):
+                with st.spinner("验证API Key..."):
+                    if validate_zhipu_api_key(st.session_state.user_api_key):
+                        st.success("✅ API Key 有效")
+                    else:
+                        st.error("❌ API Key 无效，请检查后重试")
 
-        # 调用模型（带 loading 提示）
-        with st.spinner("⏳ 正在调用模型生成测试用例，请稍候……"):
-            try:
-                result_text = call_glm(api_key, prompt)
-            except Exception as e:
-                error_msg = str(e)
-                # 对常见错误做友好提示
-                if "authentication" in error_msg.lower() or "401" in error_msg:
-                    st.error("❌ API Key 无效或已过期，请检查后重试。")
-                elif "rate" in error_msg.lower() or "429" in error_msg:
-                    st.error("❌ 请求过于频繁，请稍后再试。")
-                elif "timeout" in error_msg.lower():
-                    st.error("❌ 请求超时，请检查网络连接后重试。")
+            # 激活码信息
+            if user.get('activation_code'):
+                st.markdown(
+                    f'<div style="background:#d1ecf1;padding:10px;border-radius:6px;'
+                    f'text-align:center;font-size:12px; margin-top:10px;">'
+                    f'激活码: {user["activation_code"][:10]}...</div>',
+                    unsafe_allow_html=True,
+                )
+
+            # 使用次数
+            st.divider()
+            remaining = get_remaining_count(user['id'])
+            st.metric("今日剩余次数", remaining if remaining != -1 else "无限制")
+
+            # 激活码输入
+            st.text_input(
+                label="🎯 输入激活码",
+                key="activation_code",
+                placeholder="例如：TCGEN-PRO-2026A",
+                help="输入从面包多购买的激活码，激活后无限次使用",
+            )
+
+            activate_btn = st.button("✅ 激活", use_container_width=True)
+
+            if activate_btn:
+                code = st.session_state.get("activation_code", "").strip()
+                if not code:
+                    st.error("请先输入激活码！")
                 else:
-                    st.error(f"❌ 调用模型失败：{error_msg}")
-                return
+                    success, msg = validate_and_activate(code, user['id'], user['email'])
+                    if success:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
-        # 生成成功，更新使用次数（已激活的不计数，但调用也无妨）
-        if remaining != -1:
-            increment_usage(api_key_hash)
+            st.divider()
 
-        # 解析 Markdown 表格
-        df = parse_markdown_table(result_text)
+            # 测试类型选择
+            test_type = st.selectbox(
+                label="测试类型",
+                options=TEST_TYPES,
+                index=0,
+                help="选择需要生成的测试用例类型",
+            )
 
-        # ---------- 展示结果 ----------
-        st.success("✅ 测试用例生成完成！")
+            # 输出风格选择
+            output_style = st.selectbox(
+                label="输出风格",
+                options=OUTPUT_STYLES,
+                index=0,
+                help="详细模式会给出完整的步骤描述，简洁模式则精简概括",
+            )
 
-        # 如果表格解析成功，同时展示表格和原始文本
-        if not df.empty:
-            st.subheader("📊 结构化表格")
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.divider()
 
-            # 下载按钮
-            csv_bytes = dataframe_to_csv_bytes(df)
-            st.download_button(
-                label="📥 下载 CSV 文件",
-                data=csv_bytes,
-                file_name="test_cases.csv",
-                mime="text/csv",
+            # 生成按钮
+            generate_btn = st.button(
+                label="🚀 生成测试用例",
+                type="primary",
                 use_container_width=True,
             )
 
-            # 同时展示原始 Markdown（折叠）
-            with st.expander("📄 查看原始 Markdown 输出"):
+            # 退出登录
+            if st.button("🚪 退出登录", use_container_width=True):
+                logout_user()
+
+            # 使用说明
+            with st.expander("📖 使用说明"):
+                st.markdown(
+                    f"""
+1. 在右侧文本框中粘贴需求描述；
+2. **输入您的智谱AI API Key**（从 https://open.bigmodel.cn/ 获取）
+3. 选择测试类型和输出风格；
+4. 点击 **生成测试用例** 按钮；
+5. 等待模型返回结果，即可查看和下载。
+
+**免费额度**：每个邮箱每天可免费生成 **{FREE_DAILY_LIMIT}** 次。
+**解除限制**：[前往面包多购买激活码]({MIANBADUO_URL})，输入后即可无限次使用。
+                    """
+                )
+
+    # ---------- 主区域 ----------
+    if not st.session_state.user:
+        # 未登录状态
+        st.title(f"{PAGE_ICON} {PAGE_TITLE}")
+        st.caption("基于智谱 GLM 大模型，自动生成结构化软件测试用例")
+
+        st.divider()
+
+        # 介绍部分
+        st.markdown("""
+## 📋 产品介绍
+
+### 核心功能
+- **AI 生成测试用例**：基于 GLM-4-Flash 大模型
+- **多类型支持**：功能、接口、性能、安全测试
+- **灵活输出**：详细/简洁两种风格
+- **CSV 导出**：支持 Excel 打开
+
+### 使用流程
+1. **注册登录**：使用邮箱注册
+2. **获取API Key**：在 https://open.bigmodel.cn/ 注册并获取API Key
+3. **免费试用**：每天 5 次免费生成
+4. **购买激活码**：解锁无限次使用
+5. **生成测试用例**：输入需求，一键生成
+
+### 适用场景
+- 软件测试工程师
+- 开发人员
+- 产品经理
+- 项目负责人
+
+        """)
+
+        # 注册引导
+        st.markdown("""
+## 🚀 立即体验
+
+注册账号即可开始使用，每个邮箱每天免费生成 5 次测试用例。
+**注意**：您需要有自己的智谱AI API Key才能使用本工具。
+        """)
+        return
+
+    else:
+        # 已登录状态
+        st.title(f"{PAGE_ICON} {PAGE_TITLE}")
+        st.caption(f"欢迎回来，{st.session_state.user['email']}")
+
+        # 需求描述输入
+        st.caption("💡 提示：需求描述建议控制在7000字符以内，避免超出模型限制")
+        requirement = st.text_area(
+            label="📝 请粘贴需求描述",
+            height=220,
+            placeholder=(
+                "示例：用户注册功能。用户需要通过邮箱注册账号，"
+                "需要输入用户名、邮箱地址和密码。密码要求至少8位，"
+                "包含大小写字母和数字。注册成功后发送验证邮件。"
+            ),
+        )
+
+        # 生成逻辑区域
+        if generate_btn:
+            # 输入校验
+            if not requirement.strip():
+                st.error("❌ 请输入需求描述！")
+                return
+
+            # 文本长度检查 - 防止上下文窗口溢出
+            max_requirement_length = 7000  # 约9K tokens，预留空间给prompt
+            if len(requirement) > max_requirement_length:
+                st.warning(f"⚠️ 需求描述过长（{len(requirement)}字符），已自动截断到{max_requirement_length}字符")
+                requirement = requirement[:max_requirement_length]
+                st.rerun()  # 刷新以显示截断后的内容
+
+            # ---- 试用次数校验 ----
+            remaining = get_remaining_count(st.session_state.user['id'])
+
+            if remaining == 0:
+                st.error(
+                    f"❌ 今日免费生成次数已用完（{FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT}）。"
+                    f"请输入激活码，或[前往面包多购买]({MIANBADUO_URL})。"
+                )
+                return
+
+            # 构建 prompt
+            prompt = build_prompt(requirement, test_type, output_style)
+
+            # 检查API Key
+            user_api_key = st.session_state.get("user_api_key", "").strip()
+            if not user_api_key:
+                st.error("❌ 请先输入智谱AI API Key！")
+                return
+
+            # 调用模型（带 loading 提示）
+            with st.spinner("⏳ 正在调用模型生成测试用例，请稍候……"):
+                try:
+                    result_text = call_glm(user_api_key, prompt)  # 使用用户输入的API Key
+                except Exception as e:
+                    error_msg = str(e)
+                    # 对常见错误做友好提示
+                    if "authentication" in error_msg.lower() or "401" in error_msg:
+                        st.error("❌ API Key 无效，请检查后重试。")
+                    elif "rate" in error_msg.lower() or "429" in error_msg:
+                        st.error("❌ 请求过于频繁，请稍后再试。")
+                    elif "timeout" in error_msg.lower():
+                        st.error("❌ 请求超时，请检查网络连接后重试。")
+                    elif "context window" in error_msg.lower() or "maximum length" in error_msg.lower():
+                        st.error("❌ 输入内容过长，已达到模型上限。请简化需求描述或分拆成多个部分。")
+                    else:
+                        st.error(f"❌ 调用模型失败：{error_msg}")
+                    return
+
+            # 生成成功，更新使用次数
+            increment_usage(st.session_state.user['id'])
+
+            # 解析 Markdown 表格
+            df = parse_markdown_table(result_text)
+
+            # ---------- 展示结果 ----------
+            st.success("✅ 测试用例生成完成！")
+
+            # 如果表格解析成功，同时展示表格和原始文本
+            if not df.empty:
+                st.subheader("📊 结构化表格")
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+                # 下载按钮
+                csv_bytes = dataframe_to_csv_bytes(df)
+                st.download_button(
+                    label="📥 下载 CSV 文件",
+                    data=csv_bytes,
+                    file_name="test_cases.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+                # 同时展示原始 Markdown（折叠）
+                with st.expander("📄 查看原始 Markdown 输出"):
+                    st.markdown(result_text)
+            else:
+                # 解析失败时直接展示原始文本
+                st.warning("⚠️ 未能解析为标准表格，以下是模型原始输出：")
                 st.markdown(result_text)
-        else:
-            # 解析失败时直接展示原始文本
-            st.warning("⚠️ 未能解析为标准表格，以下是模型原始输出：")
-            st.markdown(result_text)
+
+    # ---------- 评价区域 ----------
+    st.divider()
+    tab1, tab2 = st.tabs(["🌟 查看评价", "💬 写评价"])
+
+    with tab1:
+        show_reviews_section()
+
+    with tab2:
+        show_review_submission(st.session_state.user['id'])
 
 
 # ============================================================
