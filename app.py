@@ -377,7 +377,7 @@ def validate_and_activate(activation_code: str, user_id: int, user_email: str) -
         # 检查是否已被使用
         if code_info.get("used", False):
             used_by = code_info.get("used_by", "")
-            if used_by == user_id:
+            if str(used_by) == str(user_id):
                 return False, "⚠️ 该激活码已被当前账号使用过，无需重复激活。"
             else:
                 return False, "❌ 该激活码已被其他账号使用。"
@@ -423,7 +423,7 @@ def validate_and_activate(activation_code: str, user_id: int, user_email: str) -
 
                 if verify_result.data:
                     record = verify_result.data[0]
-                    if record.get('used_by') != user_id:
+                    if str(record.get('used_by')) != str(user_id):
                         # 记录已被其他用户抢占
                         return False, "❌ 该激活码已被其他账号使用。"
 
@@ -440,7 +440,7 @@ def validate_and_activate(activation_code: str, user_id: int, user_email: str) -
                 verify_result = supabase.table('activation_codes').select('*').eq('code', code).execute()
                 if verify_result.data:
                     record = verify_result.data[0]
-                    if record.get('used_by') != user_id:
+                    if str(record.get('used_by')) != str(user_id):
                         return False, "❌ 该激活码已被其他账号使用。"
                     else:
                         # 已被当前用户激活
