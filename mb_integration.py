@@ -113,3 +113,35 @@ def verify_order_paid(order_id: str) -> tuple[bool, str]:
         return False, '❌ 订单已过期'
     else:
         return False, f'❌ 未知订单状态: {state}'
+
+
+# ============================================================
+# 兼容旧代码的函数（已弃用，但保留以避免报错）
+# ============================================================
+
+def create_purchase_order(user_id: int) -> dict:
+    """
+    已弃用：创建购买订单功能
+    现在直接跳转到面包多商品链接即可
+    """
+    return {
+        'success': False,
+        'message': '请直接访问面包多商品页面购买：https://mbd.pub/o/bread/YZaUlppuag=='
+    }
+
+
+def get_user_orders(user_id: int) -> list:
+    """
+    已弃用：获取用户订单列表
+    """
+    return []
+
+
+def get_statistics() -> dict:
+    """
+    已弃用：获取统计数据
+    """
+    return {
+        'total_orders': 0,
+        'total_revenue': 0
+    }
