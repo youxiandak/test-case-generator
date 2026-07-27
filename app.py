@@ -387,7 +387,6 @@ def validate_and_activate(activation_code: str, user_id: int, user_email: str) -
             "used": True,
             "used_by": user_id,
             "user_id": user_id,
-            "email": user_email,
             "used_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }).eq('code', code).execute()
 
@@ -414,7 +413,6 @@ def validate_and_activate(activation_code: str, user_id: int, user_email: str) -
                 'used': True,  # 直接标记为已使用
                 'used_by': user_id,
                 'user_id': user_id,
-                'email': user_email,
                 'used_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 'created_at': datetime.now().isoformat()
             }).execute()
