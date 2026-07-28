@@ -112,7 +112,15 @@ SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 # Supabase 初始化
 # ============================================================
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+try:
+    print(f"[DEBUG] Initializing Supabase...")
+    print(f"[DEBUG] SUPABASE_URL: {SUPABASE_URL}")
+    print(f"[DEBUG] SUPABASE_KEY length: {len(SUPABASE_KEY) if SUPABASE_KEY else 0}")
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print(f"[DEBUG] Supabase initialized successfully")
+except Exception as e:
+    print(f"[DEBUG] Supabase initialization failed: {str(e)}")
+    supabase = None
 
 
 # ============================================================
@@ -145,7 +153,14 @@ def hash_password(password: str) -> str:
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """验证密码"""
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    try:
+        print(f"[DEBUG] Verifying password. Plain: {plain_password[:4]}..., Hashed: {hashed_password[:20]}...")
+        result = bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+        print(f"[DEBUG] Password verification result: {result}")
+        return result
+    except Exception as e:
+        print(f"[DEBUG] Password verification error: {str(e)}")
+        return False
 
 
 # ============================================================
@@ -296,29 +311,50 @@ def login_user(email: str, password: str, ip_address: str = "unknown") -> tuple[
         (成功状态, 消息)
     """
     try:
+        print(f"[DEBUG] Login attempt for email: {email}")
+
         # 输入验证和清理
         email = sanitize_input(email, max_length=100, input_type="email")
         if not email:
             return False, "邮箱格式错误"
 
+        print(f"[DEBUG] Email sanitized: {email}")
+
         # 检查登录尝试频率（增强版）
         can_login, msg = can_attempt_login(email, ip_address)
         if not can_login:
+            print(f"[DEBUG] Login blocked by rate limit: {msg}")
             return False, msg
 
         # 查找用户
-        response = supabase.table('users').select('*').eq('email', email).execute()
+        print(f"[DEBUG] Querying user with email: {email}")
+        if not supabase:
+            print(f"[DEBUG] Supabase client is not initialized!")
+            return False, "系统错误，请稍后重试"
+
+        try:
+            response = supabase.table('users').select('*').eq('email', email).execute()
+            print(f"[DEBUG] Supabase response: {response}")
+        except Exception as e:
+            print(f"[DEBUG] Supabase query failed: {str(e)}")
+            return False, "数据库查询失败，请稍后重试"
 
         if not response.data:
+            print(f"[DEBUG] User not found: {email}")
             # 记录失败的登录尝试
             record_login_attempt(email, ip_address, success=False)
             return False, "邮箱或密码错误"  # 统一错误消息，防止账户枚举
 
         user = response.data[0]
+        print(f"[DEBUG] User found: {user['email']}, ID: {user.get('id')}")
 
         # 验证密码
+        print(f"[DEBUG] Verifying password...")
         if verify_password(password, user['password_hash']):
+            print(f"[DEBUG] Password verified successfully")
+
             # 更新最后登录时间和IP
+            print(f"[DEBUG] Updating user last login info...")
             supabase.table('users').update({
                 'last_login': datetime.now().isoformat(),
                 'last_login_ip': ip_address
@@ -326,6 +362,7 @@ def login_user(email: str, password: str, ip_address: str = "unknown") -> tuple[
 
             # 生成安全的会话令牌
             session_token = generate_session_token(user['id'], ip_address)
+            print(f"[DEBUG] Session token generated")
 
             # 防止会话固定攻击：登录后重新生成会话
             if 'user' in st.session_state:
@@ -350,6 +387,7 @@ def login_user(email: str, password: str, ip_address: str = "unknown") -> tuple[
                 'created_at': user['created_at'],
                 'last_login': datetime.now().isoformat()
             }
+            print(f"[DEBUG] User session created successfully")
 
             # 记录安全日志
             log_security_event("user_login_success", {
@@ -358,15 +396,19 @@ def login_user(email: str, password: str, ip_address: str = "unknown") -> tuple[
                 'ip_address': ip_address
             })
 
+            print(f"[DEBUG] Login successful for {email}")
             return True, "登录成功！"
         else:
+            print(f"[DEBUG] Password verification failed for {email}")
             # 记录失败的登录尝试
             record_login_attempt(email, ip_address, success=False)
             return False, "邮箱或密码错误"  # 统一错误消息，防止账户枚举
 
     except Exception as e:
-        # 简化错误记录
-        print(f"Login failed for {email}: {str(e)}")
+        # 详细错误记录
+        import traceback
+        print(f"[DEBUG] Login failed with exception: {str(e)}")
+        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
         return False, "登录失败，请稍后重试"
 
 
