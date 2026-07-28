@@ -22,6 +22,7 @@ from openai import OpenAI
 from supabase import create_client, Client
 from verification_service import send_verification, check_code, cleanup_expired_codes
 from mb_integration import create_purchase_order, get_user_orders, get_statistics
+from security import check_activation_rate_limit, sanitize_input, validate_email, validate_password, get_cached_order, cache_order
 
 
 # ============================================================
@@ -113,6 +114,14 @@ def register_user(email: str, password: str) -> tuple[bool, str]:
         (成功状态, 消息)
     """
     try:
+        # 输入验证
+        if not validate_email(email):
+            return False, "邮箱格式不正确"
+
+        valid, message = validate_password(password)
+        if not valid:
+            return False, message
+
         # 检查邮箱是否已存在
         response = supabase.table('users').select('id').eq('email', email).execute()
 
@@ -135,7 +144,8 @@ def register_user(email: str, password: str) -> tuple[bool, str]:
             return False, "注册失败，请重试"
 
     except Exception as e:
-        return False, f"注册失败: {str(e)}"
+        # 不暴露内部错误信息
+        return False, "注册失败，请稍后重试"
 
 
 def login_user(email: str, password: str) -> tuple[bool, str]:
@@ -396,11 +406,38 @@ def validate_and_activate(activation_code: str, user_id: int, user_email: str) -
     # 面包多订单号是32位字母数字组合，设置最小长度避免无意义输入
     if len(code) >= 20:  # 支持面包多订单号（32位）或较长的自定义订单号
 
+        # 检查频率限制
+        allowed, message = check_activation_rate_limit(user_id)
+        if not allowed:
+            return False, message
+
+        # 检查缓存
+        cached_data = get_cached_order(code)
+        if cached_data:
+            if cached_data.get('state') == 'success':
+                # 缓存显示已支付，继续激活流程
+                pass
+            else:
+                # 缓存显示未支付或无效
+                state = cached_data.get('state', 'unknown')
+                if state == 'cancel':
+                    return False, "❌ 订单已取消"
+                elif state == 'invalid':
+                    return False, "❌ 订单已过期"
+                else:
+                    return False, f"❌ 订单无效 ({state})"
+
         # 调用面包多API验证订单状态
         from mb_integration import verify_order_paid
+        from mb_integration import get_order_detail
 
         with st.spinner("⏳ 正在验证订单状态..."):
             is_paid, api_message = verify_order_paid(code)
+
+        # 缓存查询结果
+        order_data = get_order_detail(code)
+        if order_data.get('success'):
+            cache_order(code, order_data)
 
         if not is_paid:
             return False, api_message
@@ -446,7 +483,8 @@ def validate_and_activate(activation_code: str, user_id: int, user_email: str) -
                         # 已被当前用户激活
                         set_activated(user_id, code)
                         return True, "✅ 激活成功！"
-            return False, f"❌ 激活失败: {str(e)}"
+            # 不暴露内部错误信息
+            return False, "❌ 激活失败，请稍后重试"
 
     # 既不是数据库中的激活码，也不是有效的订单号格式
     return False, "❌ 激活码无效，请检查后重试。"
@@ -1424,6 +1462,10 @@ def main():
             # 输入校验
             if not requirement.strip():
                 st.error("❌ 请输入需求描述！")
+                return
+
+            # 清理输入，防止恶意内容
+            requirement = sanitize_input(requirement, max_length=7000)
                 return
 
             # 文本长度检查 - 防止上下文窗口溢出
