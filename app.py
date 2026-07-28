@@ -17,12 +17,13 @@ import pandas as pd
 import io
 import hashlib
 import bcrypt
+import time
 from datetime import date, datetime, timedelta
 from openai import OpenAI
 from supabase import create_client, Client
 from verification_service import send_verification, check_code, cleanup_expired_codes
 from mb_integration import create_purchase_order, get_user_orders, get_statistics
-from security import check_activation_rate_limit, sanitize_input, validate_email, validate_password, get_cached_order, cache_order
+from security import check_activation_rate_limit, sanitize_input, validate_email, validate_password, get_cached_order, cache_order, check_rate_limit
 
 
 # ============================================================
@@ -99,6 +100,49 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 # ============================================================
+# 会话安全工具
+# ============================================================
+
+def verify_session() -> bool:
+    """
+    验证会话是否有效
+
+    Returns:
+        会话是否有效
+    """
+    if 'user' not in st.session_state or not st.session_state.user:
+        return False
+
+    # 检查会话过期
+    if 'session_expiry' in st.session_state:
+        current_time = int(time.time())
+        if current_time > st.session_state.session_expiry:
+            # 会话过期，清除
+            logout_user()
+            return False
+
+    return True
+
+
+def check_user_permission(required_user_id: int) -> bool:
+    """
+    检查用户是否有权限访问资源
+
+    Args:
+        required_user_id: 要求的用户ID
+
+    Returns:
+        是否有权限
+    """
+    if not verify_session():
+        return False
+
+    current_user_id = st.session_state.user.get('id')
+
+    return str(current_user_id) == str(required_user_id)
+
+
+# ============================================================
 # 用户管理函数
 # ============================================================
 
@@ -160,11 +204,21 @@ def login_user(email: str, password: str) -> tuple[bool, str]:
         (成功状态, 消息)
     """
     try:
+        # 输入验证
+        if not validate_email(email):
+            return False, "邮箱或密码错误"
+
+        # 检查登录尝试频率
+        attempt_key = f"login_attempt_{email}"
+        allowed, remaining = check_rate_limit(attempt_key, 5, 300)  # 5次/5分钟
+        if not allowed:
+            return False, f"⏸️ 登录尝试过于频繁，请等待 {remaining} 秒后再试。"
+
         # 查找用户
         response = supabase.table('users').select('*').eq('email', email).execute()
 
         if not response.data:
-            return False, "邮箱不存在"
+            return False, "邮箱或密码错误"  # 统一错误消息，防止账户枚举
 
         user = response.data[0]
 
@@ -175,17 +229,28 @@ def login_user(email: str, password: str) -> tuple[bool, str]:
                 'last_login': datetime.now().isoformat()
             }).eq('id', user['id']).execute()
 
+            # 防止会话固定攻击：登录后重新生成会话
+            if 'user' in st.session_state:
+                del st.session_state.user
+
+            # 添加会话过期时间（24小时）
+            st.session_state.session_expiry = int(time.time()) + 86400
+
+            # 添加登录时间戳用于安全检查
+            st.session_state.login_time = datetime.now().isoformat()
+
             # 保存到 session state
             st.session_state.user = {
                 'id': user['id'],
                 'email': user['email'],
                 'activation_code': user.get('activation_code'),
-                'created_at': user['created_at']
+                'created_at': user['created_at'],
+                'last_login': datetime.now().isoformat()
             }
 
             return True, "登录成功！"
         else:
-            return False, "密码错误"
+            return False, "邮箱或密码错误"  # 统一错误消息，防止账户枚举
 
     except Exception as e:
         return False, f"登录失败: {str(e)}"
@@ -209,9 +274,15 @@ def send_email_verification_code(email: str, code_type: str = "register") -> tup
         (成功状态, 消息)
     """
     try:
-        # 检查邮箱格式
-        if '@' not in email or len(email.split('@')) != 2:
+        # 邮箱格式验证
+        if not validate_email(email):
             return False, "邮箱格式不正确"
+
+        # 验证码发送频率限制（每个邮箱1次/分钟，5次/小时）
+        email_key = f"email_code_{email}_{code_type}"
+        allowed, remaining = check_rate_limit(email_key, 5, 3600)  # 5次/小时
+        if not allowed:
+            return False, f"⏸️ 验证码发送过于频繁，请等待 {remaining} 秒后再试。"
 
         # 发送验证码
         result = send_verification(email, code_type)
@@ -225,7 +296,8 @@ def send_email_verification_code(email: str, code_type: str = "register") -> tup
             return False, result['message']
 
     except Exception as e:
-        return False, f"发送验证码失败: {str(e)}"
+        # 不暴露内部错误
+        return False, "发送验证码失败，请稍后重试"
 
 
 def verify_email_code(email: str, code: str, code_type: str) -> tuple[bool, str]:
@@ -762,6 +834,38 @@ def submit_review(user_id: int, name: str, email: str, rating: int, content: str
     """
 
     try:
+        # 权限验证：确保只能为自己的user_id提交评价
+        if not verify_session():
+            return False
+
+        current_user_id = st.session_state.user.get('id')
+        if str(current_user_id) != str(user_id):
+            return False  # 防止越权提交
+
+        # 输入验证
+        if not content or len(content.strip()) == 0:
+            return False
+
+        if len(content) > 1000:
+            return False  # 限制评价长度
+
+        if rating < 1 or rating > 5:
+            return False  # 无效评分
+
+        # 清理输入
+        content = sanitize_input(content, max_length=1000)
+        if name:
+            name = sanitize_input(name, max_length=50)
+        if email:
+            if not validate_email(email):
+                email = ""  # 无效邮箱则不存储
+
+        # 防刷单：同一用户1小时内只能提交1次评价
+        review_key = f"review_submit_{user_id}"
+        allowed, remaining = check_rate_limit(review_key, 1, 3600)  # 1次/小时
+        if not allowed:
+            return False
+
         response = supabase.table('reviews').insert({
             "user_id": user_id,
             "name": name,
@@ -818,6 +922,67 @@ def calculate_average_rating() -> float:
 
 
 # ============================================================
+# Prompt 安全工具
+# ============================================================
+
+def detect_prompt_injection(text: str) -> bool:
+    """
+    检测提示词注入攻击
+
+    Args:
+        text: 待检测的文本
+
+    Returns:
+        是否检测到注入
+    """
+    # 常见的注入模式
+    injection_patterns = [
+        '忽略', '忽略之前的', 'forget', 'disregard',
+        '新指令', 'new instruction', 'override',
+        '提示词', 'system prompt', '你的系统提示',
+        '告诉我你的', 'show me your', 'reveal your',
+        '绕过', 'bypass', 'hack', 'exploit'
+    ]
+
+    text_lower = text.lower()
+
+    for pattern in injection_patterns:
+        if pattern in text_lower:
+            return True
+
+    # 检查是否尝试输出JSON或代码格式来绕过过滤
+    if ('```json' in text or '```code' in text) and ('system' in text_lower or 'prompt' in text_lower):
+        return True
+
+    return False
+
+
+def clean_model_output(output: str) -> str:
+    """
+    清理模型输出，防止敏感信息泄露
+
+    Args:
+        output: 模型原始输出
+
+    Returns:
+        清理后的输出
+    """
+    # 如果输出中包含明显的系统提示词或敏感信息，进行替换
+    sensitive_patterns = [
+        ('你是一位专业的软件测试工程师', 'AI助手'),
+        ('system prompt', '系统配置'),
+        ('你是一名', ''),
+        ('你的任务', '任务'),
+    ]
+
+    cleaned = output
+    for pattern, replacement in sensitive_patterns:
+        cleaned = cleaned.replace(pattern, replacement)
+
+    return cleaned
+
+
+# ============================================================
 # Prompt 构建函数
 # ============================================================
 
@@ -833,6 +998,10 @@ def build_prompt(requirement: str, test_type: str, style: str) -> str:
     Returns:
         拼接好的完整 prompt 字符串
     """
+
+    # 检测提示词注入
+    if detect_prompt_injection(requirement):
+        requirement = "用户提供了测试用例生成需求（内容已清理）"
 
     # 如果需求描述过长，使用更简洁的prompt
     if len(requirement) > 3000:
@@ -1288,6 +1457,13 @@ def main():
             st.markdown("- 支持多种测试类型")
 
         else:
+            # 验证会话有效性
+            if not verify_session():
+                st.warning("⚠️ 会话已过期，请重新登录")
+                if st.button("重新登录", use_container_width=True):
+                    logout_user()
+                return
+
             # 用户已登录
             user = st.session_state.user
 
@@ -1498,6 +1674,8 @@ def main():
             with st.spinner("⏳ 正在调用模型生成测试用例，请稍候……"):
                 try:
                     result_text = call_glm(user_api_key, prompt)  # 使用用户输入的API Key
+                    # 清理模型输出，防止敏感信息泄露
+                    result_text = clean_model_output(result_text)
                 except Exception as e:
                     error_msg = str(e)
                     # 对常见错误做友好提示
