@@ -23,7 +23,8 @@ from openai import OpenAI
 from supabase import create_client, Client
 from verification_service import send_verification, check_code, cleanup_expired_codes
 from mb_integration import create_purchase_order, get_user_orders, get_statistics
-from security import check_activation_rate_limit, sanitize_input, validate_email, validate_password, get_cached_order, cache_order, check_rate_limit
+from security import check_activation_rate_limit, sanitize_input, validate_email, validate_password, get_cached_order, cache_order, check_rate_limit, can_attempt_login, record_login_attempt, validate_session_token, generate_session_token
+from api_key_security import is_api_key_safe, record_api_key_usage, get_api_key_stats
 
 
 # ============================================================
@@ -105,7 +106,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 def verify_session() -> bool:
     """
-    验证会话是否有效
+    增强的会话验证（带安全检查）
 
     Returns:
         会话是否有效
@@ -120,6 +121,50 @@ def verify_session() -> bool:
             # 会话过期，清除
             logout_user()
             return False
+
+    # 检查会话令牌（如果存在）
+    if 'session_token' in st.session_state and 'login_ip' in st.session_state:
+        client_ip = "unknown"
+        try:
+            import streamlit.web.server.websockets_ws
+            client_ip = streamlit.web.server.websockets_ws.get_remote_ip()
+        except:
+            pass
+
+        # 验证令牌和IP
+        from security import validate_session_token
+        if not validate_session_token(
+            st.session_state.session_token,
+            st.session_state.user['id'],
+            client_ip
+        ):
+            # 会话令牌无效，可能是劫持
+            from security_logging import log_security_event
+            log_security_event("session_hijack_attempt", {
+                'user_id': st.session_state.user['id'],
+                'current_ip': client_ip,
+                'stored_ip': st.session_state.get('login_ip', 'unknown')
+            })
+            logout_user()
+            return False
+
+    # 检查异常登录地点
+    if 'login_ip' in st.session_state:
+        current_ip = "unknown"
+        try:
+            import streamlit.web.server.websockets_ws
+            current_ip = streamlit.web.server.websockets_ws.get_remote_ip()
+        except:
+            pass
+
+        if current_ip != "unknown" and current_ip != st.session_state.login_ip:
+            # IP地址发生变化，记录警告
+            from security_logging import log_security_event
+            log_security_event("ip_address_change", {
+                'user_id': st.session_state.user['id'],
+                'old_ip': st.session_state.login_ip,
+                'new_ip': current_ip
+            })
 
     return True
 
@@ -192,42 +237,49 @@ def register_user(email: str, password: str) -> tuple[bool, str]:
         return False, "注册失败，请稍后重试"
 
 
-def login_user(email: str, password: str) -> tuple[bool, str]:
+def login_user(email: str, password: str, ip_address: str = "unknown") -> tuple[bool, str]:
     """
-    用户登录
+    增强的用户登录（带安全防护）
 
     Args:
         email: 邮箱
         password: 密码
+        ip_address: 客户端IP地址
 
     Returns:
         (成功状态, 消息)
     """
     try:
-        # 输入验证
-        if not validate_email(email):
-            return False, "邮箱或密码错误"
+        # 输入验证和清理
+        email = sanitize_input(email, max_length=100, input_type="email")
+        if not email:
+            return False, "邮箱格式错误"
 
-        # 检查登录尝试频率
-        attempt_key = f"login_attempt_{email}"
-        allowed, remaining = check_rate_limit(attempt_key, 5, 300)  # 5次/5分钟
-        if not allowed:
-            return False, f"⏸️ 登录尝试过于频繁，请等待 {remaining} 秒后再试。"
+        # 检查登录尝试频率（增强版）
+        can_login, msg = can_attempt_login(email, ip_address)
+        if not can_login:
+            return False, msg
 
         # 查找用户
         response = supabase.table('users').select('*').eq('email', email).execute()
 
         if not response.data:
+            # 记录失败的登录尝试
+            record_login_attempt(email, ip_address, success=False)
             return False, "邮箱或密码错误"  # 统一错误消息，防止账户枚举
 
         user = response.data[0]
 
         # 验证密码
         if verify_password(password, user['password_hash']):
-            # 更新最后登录时间
+            # 更新最后登录时间和IP
             supabase.table('users').update({
-                'last_login': datetime.now().isoformat()
+                'last_login': datetime.now().isoformat(),
+                'last_login_ip': ip_address
             }).eq('id', user['id']).execute()
+
+            # 生成安全的会话令牌
+            session_token = generate_session_token(user['id'], ip_address)
 
             # 防止会话固定攻击：登录后重新生成会话
             if 'user' in st.session_state:
@@ -236,10 +288,15 @@ def login_user(email: str, password: str) -> tuple[bool, str]:
             # 添加会话过期时间（24小时）
             st.session_state.session_expiry = int(time.time()) + 86400
 
-            # 添加登录时间戳用于安全检查
+            # 添加登录时间戳和安全令牌用于安全检查
             st.session_state.login_time = datetime.now().isoformat()
+            st.session_state.session_token = session_token
+            st.session_state.login_ip = ip_address
 
-            # 保存到 session state
+            # 记录登录成功
+            record_login_attempt(email, ip_address, success=True)
+
+            # 生成安全的用户信息（不包含敏感数据）
             st.session_state.user = {
                 'id': user['id'],
                 'email': user['email'],
@@ -248,12 +305,25 @@ def login_user(email: str, password: str) -> tuple[bool, str]:
                 'last_login': datetime.now().isoformat()
             }
 
+            # 记录安全日志
+            from security_logging import log_security_event
+            log_security_event("user_login_success", {
+                'user_id': user['id'],
+                'email': email,
+                'ip_address': ip_address
+            })
+
             return True, "登录成功！"
         else:
+            # 记录失败的登录尝试
+            record_login_attempt(email, ip_address, success=False)
             return False, "邮箱或密码错误"  # 统一错误消息，防止账户枚举
 
     except Exception as e:
-        return False, f"登录失败: {str(e)}"
+        # 记录错误
+        from security_logging import log_error
+        log_error("login_failed", str(e), {"email": email, "ip": ip_address})
+        return False, "登录失败，请稍后重试"
 
 
 def logout_user():
@@ -1057,17 +1127,28 @@ def build_prompt(requirement: str, test_type: str, style: str) -> str:
 # 模型调用函数
 # ============================================================
 
-def validate_zhipu_api_key(api_key: str) -> bool:
+def validate_zhipu_api_key(api_key: str, ip_address: str = "unknown") -> tuple[bool, str]:
     """
-    验证智谱API Key是否有效。
+    增强的智谱API Key验证（带安全检查）。
 
     Args:
         api_key: 智谱 AI 的 API Key
+        ip_address: 客户端IP地址
 
     Returns:
-        是否有效
+        (是否有效, 消息)
     """
     try:
+        # 首先进行安全检查
+        safe, msg = is_api_key_safe(api_key, ip_address)
+        if not safe:
+            return False, f"API Key 安全检查失败: {msg}"
+
+        # 格式验证
+        from api_key_security import validate_api_key_format
+        valid, format_msg = validate_api_key_format(api_key)
+        if not valid:
+            return False, f"API Key 格式错误: {format_msg}"
         client = OpenAI(
             api_key=api_key,
             base_url=ZHIPU_BASE_URL,
@@ -1376,6 +1457,15 @@ def show_review_submission(user_id: int):
     Args:
         user_id: 用户 ID
     """
+    # 双重验证确保用户ID有效
+    if not verify_session():
+        st.error("❌ 会话无效，请重新登录")
+        st.rerun()
+
+    current_user_id = st.session_state.user.get('id')
+    if str(current_user_id) != str(user_id):
+        st.error("❌ 权限验证失败")
+        st.rerun()
 
     st.subheader("💬 写评价")
     st.markdown("您的反馈对我们很重要！")
@@ -1462,7 +1552,7 @@ def main():
                 st.warning("⚠️ 会话已过期，请重新登录")
                 if st.button("重新登录", use_container_width=True):
                     logout_user()
-                st.rerun()
+                st.rerun()  # 使用rerun刷新页面
 
             # 用户已登录
             user = st.session_state.user
@@ -1521,7 +1611,14 @@ def main():
                 if not code:
                     st.error("请先输入激活码！")
                 else:
-                    success, msg = validate_and_activate(code, user['id'], user['email'])
+                    # 确保user_id有效
+                    user_id = user.get('id')
+                    if not user_id:
+                        st.error("❌ 用户信息异常，请重新登录")
+                        logout_user()
+                        st.rerun()
+
+                    success, msg = validate_and_activate(code, user_id, user['email'])
                     if success:
                         st.success(msg)
                         st.rerun()
@@ -1650,7 +1747,14 @@ def main():
                 st.rerun()  # 刷新以显示截断后的内容
 
             # ---- 试用次数校验 ----
-            remaining = get_remaining_count(st.session_state.user['id'])
+            # 确保用户ID有效
+            user_id = st.session_state.user.get('id')
+            if not user_id:
+                st.error("❌ 用户信息异常，请重新登录")
+                logout_user()
+                st.rerun()
+
+            remaining = get_remaining_count(user_id)
 
             if remaining == 0:
                 st.error(
@@ -1662,15 +1766,56 @@ def main():
             # 构建 prompt
             prompt = build_prompt(requirement, test_type, output_style)
 
-            # 检查API Key
+            # 检查API Key（增强版安全检查）
             user_api_key = st.session_state.get("user_api_key", "").strip()
             if not user_api_key:
                 st.error("❌ 请先输入智谱AI API Key！")
                 st.rerun()
 
-            # 调用模型（带 loading 提示）
+            # 获取客户端IP
+            try:
+                import streamlit.web.server.websockets_ws
+                client_ip = streamlit.web.server.websockets_ws.get_remote_ip()
+            except:
+                client_ip = "unknown"
+
+            # 验证API Key安全性
+            safe, msg = is_api_key_safe(user_api_key, client_ip)
+            if not safe:
+                st.error(f"❌ {msg}")
+
+                # 记录安全事件
+                from security_logging import log_security_event
+                log_security_event("api_key_rejected", {
+                    'user_id': st.session_state.user['id'],
+                    'api_key_hash': hashlib.sha256(user_api_key.encode()).hexdigest()[:8] + "...",
+                    'ip_address': client_ip,
+                    'reason': msg
+                })
+
+                st.rerun()
+
+            # 调用模型（带 loading 提示和安全记录）
             with st.spinner("⏳ 正在调用模型生成测试用例，请稍候……"):
                 try:
+                    # 记录API Key使用（成功）
+                    from api_key_security import record_api_key_usage
+                    usage_result = record_api_key_usage(
+                        user_api_key,
+                        client_ip,
+                        "Test Case Generation",
+                        success=True
+                    )
+
+                    # 记录到安全日志
+                    from security_logging import log_security_event
+                    log_security_event("api_key_used", {
+                        'user_id': st.session_state.user['id'],
+                        'usage_count': usage_result.get('usage_count', 0),
+                        'success_rate': usage_result.get('success_rate', 0),
+                        'ip_address': client_ip
+                    })
+
                     result_text = call_glm(user_api_key, prompt)  # 使用用户输入的API Key
                     # 清理模型输出，防止敏感信息泄露
                     result_text = clean_model_output(result_text)
@@ -1729,7 +1874,18 @@ def main():
         show_reviews_section()
 
     with tab2:
-        show_review_submission(st.session_state.user['id'])
+        # 检查用户是否登录
+        if st.session_state.user and verify_session():
+            show_review_submission(st.session_state.user['id'])
+        else:
+            st.warning("💡 请先登录后再提交评价")
+            with st.expander("登录提示"):
+                st.markdown("""
+                **如何登录？**
+                1. 在页面左侧点击"登录"按钮
+                2. 输入您的邮箱和密码
+                3. 登录成功后即可提交评价
+                """)
 
 
 # ============================================================
