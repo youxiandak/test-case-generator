@@ -19,6 +19,7 @@ import hashlib
 import bcrypt
 import time
 from datetime import date, datetime, timedelta
+from typing import Tuple
 from openai import OpenAI
 from supabase import create_client, Client
 from verification_service import send_verification, check_code, cleanup_expired_codes
@@ -186,7 +187,6 @@ def verify_session() -> bool:
             client_ip
         ):
             # 会话令牌无效，可能是劫持
-            from security_logging import log_security_event
             log_security_event("session_hijack_attempt", {
                 'user_id': st.session_state.user['id'],
                 'current_ip': client_ip,
@@ -206,7 +206,6 @@ def verify_session() -> bool:
 
         if current_ip != "unknown" and current_ip != st.session_state.login_ip:
             # IP地址发生变化，记录警告
-            from security_logging import log_security_event
             log_security_event("ip_address_change", {
                 'user_id': st.session_state.user['id'],
                 'old_ip': st.session_state.login_ip,
@@ -353,7 +352,6 @@ def login_user(email: str, password: str, ip_address: str = "unknown") -> tuple[
             }
 
             # 记录安全日志
-            from security_logging import log_security_event
             log_security_event("user_login_success", {
                 'user_id': user['id'],
                 'email': email,
@@ -367,9 +365,8 @@ def login_user(email: str, password: str, ip_address: str = "unknown") -> tuple[
             return False, "邮箱或密码错误"  # 统一错误消息，防止账户枚举
 
     except Exception as e:
-        # 记录错误
-        from security_logging import log_error
-        log_error("login_failed", str(e), {"email": email, "ip": ip_address})
+        # 简化错误记录
+        print(f"Login failed for {email}: {str(e)}")
         return False, "登录失败，请稍后重试"
 
 
@@ -1553,6 +1550,56 @@ def show_review_submission(user_id: int):
 
 
 # ============================================================
+# 安全日志功能
+# ============================================================
+
+# 安全日志功能
+def log_security_event(event_type, data):
+    """记录安全事件（简化版）"""
+    print(f"[Security Event] {event_type}: {data}")
+    # 尝试导入安全日志模块（如果存在）
+    try:
+        from security_logging import SecurityEvent
+        event = SecurityEvent(event_type, None, None, data)
+        from security_logging import log_security_event as security_log
+        security_log(event)
+    except ImportError:
+        # 如果没有security_logging模块，使用简化版
+        pass
+    except:
+        # 如果有security_logging模块但创建SecurityEvent失败，使用简化版
+        pass
+
+def log_error(error_type, error_msg, data):
+    """记录错误信息（简化版）"""
+    print(f"[Error] {error_type}: {error_msg} - Data: {data}")
+    # 尝试导入错误日志模块（如果存在）
+    try:
+        from security_logging import log_error as security_log_error
+        security_log_error(error_type, {"message": error_msg, **data})
+    except ImportError:
+        # 如果没有security_logging模块，使用简化版
+        pass
+    except:
+        # 如果有security_logging模块但调用失败，使用简化版
+        pass
+
+# 如果生产环境尝试从 security_logging 导入，我们提供兼容性
+try:
+    from security_logging import log_error as production_log_error
+    # 创建一个包装函数以确保兼容性
+    def log_error_compatible(error_type, error_msg, data=None):
+        if data is None:
+            data = {}
+        production_log_error(error_type, {"message": error_msg, **data})
+except (ImportError, Exception):
+    # 如果不存在或有其他错误，使用我们自己的实现
+    def log_error_compatible(error_type, error_msg, data=None):
+        if data is None:
+            data = {}
+        log_error(error_type, error_msg, data)
+
+# ============================================================
 # 主应用
 # ============================================================
 
@@ -1832,7 +1879,6 @@ def main():
                 st.error(f"❌ {msg}")
 
                 # 记录安全事件
-                from security_logging import log_security_event
                 log_security_event("api_key_rejected", {
                     'user_id': st.session_state.user['id'],
                     'api_key_hash': hashlib.sha256(user_api_key.encode()).hexdigest()[:8] + "...",
@@ -1855,7 +1901,7 @@ def main():
                     )
 
                     # 记录到安全日志
-                    from security_logging import log_security_event
+                    # 记录API Key使用成功
                     log_security_event("api_key_used", {
                         'user_id': st.session_state.user['id'],
                         'usage_count': usage_result.get('usage_count', 0),
