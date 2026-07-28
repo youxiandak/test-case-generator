@@ -353,12 +353,20 @@ def login_user(email: str, password: str, ip_address: str = "unknown") -> tuple[
         if verify_password(password, user['password_hash']):
             print(f"[DEBUG] Password verified successfully")
 
-            # 更新最后登录时间和IP
+            # 更新最后登录时间（不更新IP，因为列可能不存在）
             print(f"[DEBUG] Updating user last login info...")
-            supabase.table('users').update({
-                'last_login': datetime.now().isoformat(),
-                'last_login_ip': ip_address
-            }).eq('id', user['id']).execute()
+            try:
+                # 先尝试更新包含IP的版本
+                supabase.table('users').update({
+                    'last_login': datetime.now().isoformat(),
+                    'last_login_ip': ip_address
+                }).eq('id', user['id']).execute()
+            except Exception as e:
+                print(f"[DEBUG] Failed to update with IP, trying without IP: {str(e)}")
+                # 如果失败，只更新时间
+                supabase.table('users').update({
+                    'last_login': datetime.now().isoformat()
+                }).eq('id', user['id']).execute()
 
             # 生成安全的会话令牌
             session_token = generate_session_token(user['id'], ip_address)
@@ -1390,7 +1398,71 @@ def show_login_register_sidebar():
                     st.error(msg)
 
         with st.expander("忘记密码？"):
-            st.info("请通过验证码重置密码")
+            st.info("请输入你的邮箱，我们会发送验证码到你的邮箱")
+
+            reset_email = st.text_input("注册邮箱", key="reset_email")
+
+            if st.button("发送重置验证码", use_container_width=True):
+                if not reset_email:
+                    st.error("请输入邮箱")
+                else:
+                    # 验证邮箱格式
+                    if not validate_email(reset_email):
+                        st.error("邮箱格式不正确")
+                    else:
+                        # 检查用户是否存在
+                        response = supabase.table('users').select('id').eq('email', reset_email).execute()
+                        if not response.data:
+                            st.error("该邮箱未注册")
+                        else:
+                            # 生成并发送重置验证码
+                            success, msg = send_email_verification_code(reset_email, "reset")
+                            if success:
+                                st.success(msg)
+                                st.session_state.reset_email = reset_email
+                                st.session_state.reset_step = "verify"
+                            else:
+                                st.error(msg)
+
+            # 密码重置步骤2：验证验证码
+            if hasattr(st.session_state, 'reset_step') and st.session_state.reset_step == "verify" and hasattr(st.session_state, 'reset_email'):
+                st.subheader("验证邮箱并重置密码")
+
+                reset_code = st.text_input("验证码", key="reset_code")
+                new_password = st.text_input("新密码", type="password", key="new_password")
+                confirm_password = st.text_input("确认密码", type="password", key="confirm_password")
+
+                if st.button("重置密码", use_container_width=True):
+                    if not reset_code or not new_password or not confirm_password:
+                        st.error("请填写所有字段")
+                    elif new_password != confirm_password:
+                        st.error("两次输入的密码不一致")
+                    elif len(new_password) < 6:
+                        st.error("密码长度至少6位")
+                    else:
+                        # 验证验证码
+                        result = check_code(st.session_state.reset_email, reset_code, "reset")
+                        if result['success']:
+                            # 更新密码
+                            hashed_password = hash_password(new_password)
+                            update_result = supabase.table('users').update({
+                                'password_hash': hashed_password
+                            }).eq('email', st.session_state.reset_email).execute()
+
+                            if update_result.data:
+                                st.success("密码重置成功！请使用新密码登录")
+                                # 清除状态
+                                del st.session_state.reset_step
+                                del st.session_state.reset_email
+                                # 切换到登录标签
+                                st.session_state.active_tab = "login_tab"
+                            else:
+                                st.error("密码重置失败，请稍后重试")
+                        else:
+                            if result.get('expired'):
+                                st.error("验证码已过期，请重新发送")
+                            else:
+                                st.error("验证码错误")
 
     with tab2:
         st.subheader("注册")
