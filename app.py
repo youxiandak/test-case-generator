@@ -1629,14 +1629,15 @@ def log_error(error_type, error_msg, data):
 # 如果生产环境尝试从 security_logging 导入，我们提供兼容性
 try:
     from security_logging import log_error as production_log_error
-    # 创建一个包装函数以确保兼容性
     def log_error_compatible(error_type, error_msg, data=None):
+        """兼容性函数，调用 production_log_error"""
         if data is None:
             data = {}
         production_log_error(error_type, {"message": error_msg, **data})
 except (ImportError, Exception):
     # 如果不存在或有其他错误，使用我们自己的实现
     def log_error_compatible(error_type, error_msg, data=None):
+        """兼容性函数，回退到 log_error"""
         if data is None:
             data = {}
         log_error(error_type, error_msg, data)
