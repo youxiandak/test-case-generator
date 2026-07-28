@@ -1431,7 +1431,7 @@ def main():
     # 处理购买页面路由
     if st.session_state.get('show_purchase_page') and st.session_state.user:
         show_purchase_page(st.session_state.user['id'])
-        return
+        return  # 这个是合理的，在函数调用后退出
 
     # ---------- 页面基础配置 ----------
     st.set_page_config(
@@ -1462,7 +1462,7 @@ def main():
                 st.warning("⚠️ 会话已过期，请重新登录")
                 if st.button("重新登录", use_container_width=True):
                     logout_user()
-                return
+                st.rerun()
 
             # 用户已登录
             user = st.session_state.user
@@ -1614,7 +1614,6 @@ def main():
 注册账号即可开始使用，每个邮箱每天免费生成 5 次测试用例。
 **注意**：您需要有自己的智谱AI API Key才能使用本工具。
         """)
-        return
 
     else:
         # 已登录状态
@@ -1638,11 +1637,10 @@ def main():
             # 输入校验
             if not requirement.strip():
                 st.error("❌ 请输入需求描述！")
-                return
+                st.rerun()
 
             # 清理输入，防止恶意内容
             requirement = sanitize_input(requirement, max_length=7000)
-                return
 
             # 文本长度检查 - 防止上下文窗口溢出
             max_requirement_length = 7000  # 约9K tokens，预留空间给prompt
@@ -1659,7 +1657,7 @@ def main():
                     f"❌ 今日免费生成次数已用完（{FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT}）。"
                     f"请输入激活码，或[前往面包多购买]({MIANBADUO_URL})。"
                 )
-                return
+                st.rerun()
 
             # 构建 prompt
             prompt = build_prompt(requirement, test_type, output_style)
@@ -1668,7 +1666,7 @@ def main():
             user_api_key = st.session_state.get("user_api_key", "").strip()
             if not user_api_key:
                 st.error("❌ 请先输入智谱AI API Key！")
-                return
+                st.rerun()
 
             # 调用模型（带 loading 提示）
             with st.spinner("⏳ 正在调用模型生成测试用例，请稍候……"):
@@ -1689,7 +1687,7 @@ def main():
                         st.error("❌ 输入内容过长，已达到模型上限。请简化需求描述或分拆成多个部分。")
                     else:
                         st.error(f"❌ 调用模型失败：{error_msg}")
-                    return
+                    st.rerun()
 
             # 生成成功，更新使用次数
             increment_usage(st.session_state.user['id'])
